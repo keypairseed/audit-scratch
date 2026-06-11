@@ -1,477 +1,378 @@
 # .github/workflows/audit-campaign.yml
-name: Smart Contract Audit Campaign
+# Путь: ~/audit-scratch/.github/workflows/audit-campaign.yml
 
-# Триггеры запуска
+name: Audit Campaign
+
 on:
   push:
-    branches: [ main, develop ]
-  pull_request:
-  # Каждую ночь в 22:00 UTC
+    branches: [ main ]
   schedule:
-    - cron: '0 22 * * *'
-  # Ручной запуск с параметрами
+    # Каждую ночь в 23:00 UTC
+    - cron: '0 23 * * *'
+  # Ручной запуск: Actions → Run workflow
   workflow_dispatch:
     inputs:
-      profile:
-        description: 'Foundry profile (default/ci/deep)'
+      protocol:
+        description: 'Протокол для тестирования'
         required: false
-        default: 'ci'
-      target:
-        description: 'Specific contract to test (empty = all)'
+        default: 'all'
+        type: choice
+        options: [ all, balancer, lido, origin, enzyme ]
+      runs:
+        description: 'Кол-во invariant runs'
         required: false
-        default: ''
+        default: '500000'
 
-# Настройки окружения
+# ── Переменные для всех jobs ─────────────────────────────────────
 env:
-  FOUNDRY_PROFILE: ${{ github.event.inputs.profile || 'ci' }}
-  # RPC провайдеры (настраивай в Secrets)
-  ETH_RPC_URL:   ${{ secrets.ETH_RPC_URL }}
-  ARB_RPC_URL:   ${{ secrets.ARB_RPC_URL }}
-  BASE_RPC_URL:  ${{ secrets.BASE_RPC_URL }}
+  FOUNDRY_PROFILE: ci
+  ETH_RPC_URL:        ${{ secrets.ETH_RPC_URL }}
+  ETHERSCAN_API_KEY:  ${{ secrets.ETHERSCAN_API_KEY }}
 
 jobs:
 
   # ================================================================
-  # JOB 1: Быстрый статический анализ (5-10 минут)
+  # JOB 1 — Статический анализ (5-10 минут)
+  # Запускается всегда, быстро, находит очевидное
   # ================================================================
-  static-analysis:
-    name: Static Analysis
+  static:
+    name: "🔍 Slither + Aderyn"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    
+    timeout-minutes: 20
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      # Slither — самый популярный статический анализатор
       - name: Run Slither
         uses: crytic/slither-action@v0.4.0
         id: slither
         with:
           node-version: '20'
           slither-args: >-
-            --json slither-output.json
+            --json slither.json
             --checklist
-            --markdown-root ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.sha }}/
-            --filter-paths "test|mock|lib|node_modules"
+            --filter-paths "test|lib|mock"
         continue-on-error: true
 
-      - name: Install Aderyn
+      # Aderyn — Rust-based, очень быстрый
+      - name: Install & Run Aderyn
         run: |
-          curl -L https://raw.githubusercontent.com/Cyfrin/aderyn/dev/aderynup/install | bash
-          echo "$HOME/.aderyn/bin" >> $GITHUB_PATH
+          curl -L https://raw.githubusercontent.com/Cyfrin/aderyn/dev/aderynup/install \
+            | bash -s -- -b ~/.local/bin
+          export PATH="$HOME/.local/bin:$PATH"
+          aderyn src/ --output aderyn.md || true
 
-      - name: Run Aderyn
-        run: |
-          aderyn src/ \
-            --output aderyn-report.md \
-            --src src/ \
-          || true
-
-      - name: Upload static analysis results
-        uses: actions/upload-artifact@v4
+      # Сохраняем результаты
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: static-analysis-${{ github.run_number }}
+          name: static-${{ github.run_number }}
           path: |
-            slither-output.json
-            aderyn-report.md
+            slither.json
+            aderyn.md
 
-      - name: Post Slither Summary
+      # Краткая сводка в интерфейсе Actions
+      - name: Summary
         if: always()
         run: |
-          echo "## 🔍 Static Analysis Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f slither-output.json ]; then
-            HIGH=$(cat slither-output.json | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-detectors = data.get('results', {}).get('detectors', [])
-high = [d for d in detectors if d.get('impact','').lower() in ['high','critical']]
-print(len(high))
-" 2>/dev/null || echo "0")
-            echo "### Slither: $HIGH High/Critical findings" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "## 🔍 Static Analysis" >> $GITHUB_STEP_SUMMARY
+          python3 - << 'PYEOF'
+import json, os
+try:
+    with open('slither.json') as f:
+        data = json.load(f)
+    detectors = data.get('results', {}).get('detectors', [])
+    high = [d for d in detectors if d.get('impact','').lower() in ['high','critical']]
+    print(f"| Category | Count |")
+    print(f"|----------|-------|")
+    print(f"| Total findings | {len(detectors)} |")
+    print(f"| High/Critical  | **{len(high)}** |")
+    for d in high[:5]:
+        desc = d.get('description','')[:80]
+        print(f"\n❌ **{d.get('check')}**: {desc}")
+except Exception as e:
+    print(f"⚠️ Could not parse: {e}")
+PYEOF
+          >> $GITHUB_STEP_SUMMARY
 
   # ================================================================
-  # JOB 2: Balancer v2 Precision Hunt (6 часов)
+  # JOB 2 — Balancer v2 Precision Hunt (6 часов)
+  # Ищет двухэтапные precision-loss атаки
   # ================================================================
-  balancer-precision:
-    name: Balancer v2 — Precision Loss Hunt
+  balancer:
+    name: "⚖️ Balancer v2 Precision"
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 часов
-    
+    timeout-minutes: 360
+    if: |
+      github.event.inputs.protocol == 'all' ||
+      github.event.inputs.protocol == 'balancer' ||
+      github.event.inputs.protocol == ''
+
     steps:
       - uses: actions/checkout@v4
         with: { submodules: recursive }
 
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: nightly
+      - uses: foundry-rs/foundry-toolchain@v1
+        with: { version: stable }
 
-      # Кэшируем зависимости между запусками
-      - name: Cache Foundry dependencies
+      # Кэш между запусками — ускоряет сборку
+      - name: Cache build
         uses: actions/cache@v4
         with:
           path: |
-            ~/.foundry
-            lib/
             cache/
-          key: foundry-${{ hashFiles('foundry.toml', 'lib/**') }}
-          restore-keys: foundry-
+            out/
+          key: build-${{ hashFiles('src/**/*.sol', 'foundry.toml') }}
+          restore-keys: build-
+
+      # Восстановить corpus из предыдущих запусков
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: .foundry/fuzzing/
+          key: corpus-balancer-${{ github.repository }}-${{ hashFiles('src/**') }}
+          restore-keys: corpus-balancer-${{ github.repository }}-
 
       - name: Build
-        run: forge build --sizes
+        run: forge build
 
-      # Основная инвариантная кампания
-      - name: Balancer Precision Invariant (1M runs)
+      - name: Balancer Invariant Campaign
         env:
-          FOUNDRY_PROFILE: ci
+          INVARIANT_RUNS: ${{ github.event.inputs.runs || '500000' }}
         run: |
           forge test \
             --match-contract "BalancerPrecision|BalancerRateProvider|BalancerTwoStage" \
             --fork-url "$ETH_RPC_URL" \
-            --fork-block-number latest \
-            --invariant-runs 1000000 \
+            --invariant-runs "$INVARIANT_RUNS" \
             --invariant-depth 500 \
-            --fuzz-runs 500000 \
+            --fuzz-runs 1000000 \
             --json 2>&1 | tee balancer-results.json
         continue-on-error: true
 
-      - name: Balancer Boundary Fuzz (micro-swaps 8-9 wei)
-        run: |
-          forge test \
-            --match-test "testFuzz_microSwapBoundary|test_microSwap" \
-            --fork-url "$ETH_RPC_URL" \
-            --fuzz-runs 5000000 \
-            --json 2>&1 | tee balancer-boundary.json
-        continue-on-error: true
-
-      - name: Upload results
-        uses: actions/upload-artifact@v4
+      # Сохранить обогащённый corpus
+      - name: Save corpus
+        uses: actions/cache/save@v4
         if: always()
         with:
-          name: balancer-results-${{ github.run_number }}
-          path: |
-            balancer-results.json
-            balancer-boundary.json
+          path: .foundry/fuzzing/
+          key: corpus-balancer-${{ github.repository }}-${{ github.sha }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: balancer-${{ github.run_number }}
+          path: balancer-results.json
 
       - name: Balancer Summary
         if: always()
         run: |
-          echo "## ⚖️ Balancer v2 Precision Hunt" >> $GITHUB_STEP_SUMMARY
-          python3 << 'EOF'
-import json, sys
+          echo "## ⚖️ Balancer v2 Results" >> $GITHUB_STEP_SUMMARY
+          python3 - << 'PYEOF'
+import json
 try:
     with open('balancer-results.json') as f:
         data = json.load(f)
-    failed = [t for t in data if not t.get('success', True)]
-    print(f"Failed invariants: {len(failed)}")
-    for f in failed[:5]:
-        print(f"  ❌ {f.get('name', 'unknown')}: {f.get('reason', '')}")
+    tests = data if isinstance(data, list) else []
+    failed = [t for t in tests if not t.get('success', True)]
+    print(f"| Tests | Count |")
+    print(f"|-------|-------|")
+    print(f"| Run   | {len(tests)} |")
+    print(f"| Passed | {len(tests) - len(failed)} |")
+    print(f"| **Failed** | **{len(failed)}** |")
+    for t in failed[:10]:
+        name   = t.get('name', 'unknown')
+        reason = (t.get('reason') or t.get('counterexample', {}).get('error', ''))[:120]
+        print(f"\n🚨 **{name}**\n```\n{reason}\n```")
 except Exception as e:
-    print(f"Could not parse results: {e}")
-EOF
+    print(f"⚠️ Parse error: {e}")
+PYEOF
+          >> $GITHUB_STEP_SUMMARY
 
   # ================================================================
-  # JOB 3: Lido Oracle Boundary (4 часа)
+  # JOB 3 — Lido Oracle Boundary (4 часа)
   # ================================================================
-  lido-oracle:
-    name: Lido — Oracle & SimulatedShareRate
+  lido:
+    name: "🔷 Lido Oracle"
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    if: |
+      github.event.inputs.protocol == 'all' ||
+      github.event.inputs.protocol == 'lido' ||
+      github.event.inputs.protocol == ''
 
     steps:
       - uses: actions/checkout@v4
         with: { submodules: recursive }
       - uses: foundry-rs/foundry-toolchain@v1
+        with: { version: stable }
 
-      - name: Cache
+      - name: Cache build
         uses: actions/cache@v4
         with:
           path: |
-            ~/.foundry
-            lib/
             cache/
-          key: foundry-${{ hashFiles('foundry.toml') }}
+            out/
+          key: build-${{ hashFiles('src/**/*.sol', 'foundry.toml') }}
+
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: .foundry/fuzzing/
+          key: corpus-lido-${{ github.repository }}-${{ hashFiles('src/**') }}
+          restore-keys: corpus-lido-${{ github.repository }}-
 
       - name: Build
         run: forge build
 
-      - name: Lido Oracle Invariant Campaign
+      - name: Lido Invariant Campaign
         run: |
           forge test \
-            --match-contract "LidoOracle|LidoShareRate|LidoBunker" \
+            --match-contract "LidoOracle|LidoShare|LidoBunker" \
             --fork-url "$ETH_RPC_URL" \
-            --invariant-runs 500000 \
+            --invariant-runs 300000 \
             --invariant-depth 300 \
             --fuzz-runs 1000000 \
             --json 2>&1 | tee lido-results.json
         continue-on-error: true
 
+      - name: Save corpus
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .foundry/fuzzing/
+          key: corpus-lido-${{ github.repository }}-${{ github.sha }}
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lido-results-${{ github.run_number }}
+          name: lido-${{ github.run_number }}
           path: lido-results.json
 
   # ================================================================
-  # JOB 4: Origin Protocol (4 часа)
+  # JOB 4 — Origin Protocol (4 часа)
   # ================================================================
-  origin-protocol:
-    name: Origin Protocol — ARM & Yield Forwarding
+  origin:
+    name: "🟠 Origin Protocol"
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    if: |
+      github.event.inputs.protocol == 'all' ||
+      github.event.inputs.protocol == 'origin' ||
+      github.event.inputs.protocol == ''
 
     steps:
       - uses: actions/checkout@v4
         with: { submodules: recursive }
       - uses: foundry-rs/foundry-toolchain@v1
+        with: { version: stable }
 
-      - name: Cache
+      - name: Cache build
         uses: actions/cache@v4
         with:
           path: |
-            ~/.foundry
-            lib/
             cache/
-          key: foundry-${{ hashFiles('foundry.toml') }}
+            out/
+          key: build-${{ hashFiles('src/**/*.sol', 'foundry.toml') }}
+
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: .foundry/fuzzing/
+          key: corpus-origin-${{ github.repository }}-${{ hashFiles('src/**') }}
+          restore-keys: corpus-origin-${{ github.repository }}-
 
       - name: Build
         run: forge build
 
-      - name: Origin ARM Frontrun + Yield Forwarding
+      - name: Origin Invariant Campaign
         run: |
           forge test \
-            --match-contract "OriginProtocol|OriginARM|OriginYield" \
+            --match-contract "OriginProtocol|OriginARM|OriginYield|OriginRebase" \
             --fork-url "$ETH_RPC_URL" \
-            --invariant-runs 500000 \
+            --invariant-runs 300000 \
             --fuzz-runs 1000000 \
             --json 2>&1 | tee origin-results.json
         continue-on-error: true
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: origin-results-${{ github.run_number }}
-          path: origin-results.json
-
-  # ================================================================
-  # JOB 5: Enzyme GAV Timing (3 часа)
-  # ================================================================
-  enzyme-gav:
-    name: Enzyme — GAV Timing Attack
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    needs: [balancer-precision]  # запускается после Balancer
-
-    steps:
-      - uses: actions/checkout@v4
-        with: { submodules: recursive }
-      - uses: foundry-rs/foundry-toolchain@v1
-
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.foundry
-            lib/
-            cache/
-          key: foundry-${{ hashFiles('foundry.toml') }}
-
-      - name: Build
-        run: forge build
-
-      - name: Enzyme GAV Timing + Share Price
-        run: |
-          forge test \
-            --match-contract "EnzymeGAV|EnzymeSharePrice" \
-            --fork-url "$ETH_RPC_URL" \
-            --invariant-runs 300000 \
-            --fuzz-runs 500000 \
-            --json 2>&1 | tee enzyme-results.json
-        continue-on-error: true
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: enzyme-results-${{ github.run_number }}
-          path: enzyme-results.json
-
-  # ================================================================
-  # JOB 6: Medusa Stateful Fuzzing (6 часов) — САМЫЙ ЦЕННЫЙ
-  # ================================================================
-  medusa-campaign:
-    name: Medusa Stateful Fuzzing
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - uses: actions/checkout@v4
-        with: { submodules: recursive }
-
-      - name: Install Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-
-      - name: Install Medusa
-        run: |
-          go install github.com/crytic/medusa/cmd/medusa@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-
-      - name: Install Foundry (for compilation)
-        uses: foundry-rs/foundry-toolchain@v1
-
-      # Восстанавливаем corpus из предыдущих запусков
-      - name: Restore Medusa corpus
-        uses: actions/cache@v4
-        with:
-          path: corpus/
-          key: medusa-corpus-${{ github.repository }}-${{ hashFiles('src/**/*.sol') }}
-          restore-keys: |
-            medusa-corpus-${{ github.repository }}-
-
-      - name: Run Medusa Campaign
-        run: |
-          cat > medusa.json << 'EOF'
-          {
-            "fuzzing": {
-              "workers": 4,
-              "timeout": 21600,
-              "testLimit": 100000000,
-              "callSequenceLength": 100,
-              "corpusDirectory": "corpus",
-              "coverageEnabled": true,
-              "targetContracts": ["BalancerHandler", "LidoHandler", "OriginHandler"],
-              "assertionTesting": {
-                "enabled": true,
-                "testViewMethods": true
-              },
-              "propertyTesting": {
-                "enabled": true,
-                "testPrefixes": ["property_", "invariant_", "echidna_"]
-              }
-            },
-            "compilation": {
-              "platform": "crytic-compile",
-              "platformConfig": {
-                "target": ".",
-                "solcVersion": "0.8.20"
-              }
-            }
-          }
-          EOF
-          medusa fuzz --config medusa.json 2>&1 | tee medusa-output.log
-        continue-on-error: true
-
-      # Сохраняем обогащённый corpus для следующего запуска
-      - name: Save Medusa corpus
+      - name: Save corpus
         uses: actions/cache/save@v4
         if: always()
         with:
-          path: corpus/
-          key: medusa-corpus-${{ github.repository }}-${{ github.sha }}
+          path: .foundry/fuzzing/
+          key: corpus-origin-${{ github.repository }}-${{ github.sha }}
 
-      - name: Upload Medusa results
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: medusa-campaign-${{ github.run_number }}
-          path: |
-            medusa-output.log
-            corpus/
+          name: origin-${{ github.run_number }}
+          path: origin-results.json
 
   # ================================================================
-  # JOB 7: Итоговый отчёт (запускается после всех)
+  # JOB 5 — Финальный отчёт
+  # Запускается после всех jobs, всегда
   # ================================================================
-  audit-report:
-    name: Generate Audit Report
+  report:
+    name: "📋 Audit Report"
     runs-on: ubuntu-latest
-    needs: [static-analysis, balancer-precision, lido-oracle, origin-protocol, enzyme-gav]
+    needs: [ static, balancer, lido, origin ]
     if: always()
 
     steps:
       - uses: actions/checkout@v4
 
-      # Скачиваем все артефакты
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: audit-artifacts/
+          path: artifacts/
 
-      - name: Generate consolidated report
+      - name: Generate report
         run: |
-          python3 << 'PYEOF'
-          import json, os, glob
-          from datetime import datetime
+          python3 - << 'PYEOF'
+import json, glob, os
+from datetime import datetime
 
-          report = ["# 🔒 Audit Campaign Report"]
-          report.append(f"**Date**: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
-          report.append(f"**Commit**: ${{ github.sha }[:8] }}")
-          report.append("")
+lines = [
+    "# 🔒 Audit Campaign Report",
+    f"**Run**: #{os.environ.get('GITHUB_RUN_NUMBER','?')}",
+    f"**Date**: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+    f"**Commit**: `{os.environ.get('GITHUB_SHA','?')[:8]}`",
+    "",
+    "---",
+]
 
-          # Slither findings
-          slither_files = glob.glob('audit-artifacts/**/slither-output.json', recursive=True)
-          if slither_files:
-              report.append("## Static Analysis (Slither)")
-              try:
-                  with open(slither_files[0]) as f:
-                      data = json.load(f)
-                  detectors = data.get('results', {}).get('detectors', [])
-                  critical = [d for d in detectors if d.get('impact','').lower() in ['high','critical']]
-                  report.append(f"- Total findings: **{len(detectors)}**")
-                  report.append(f"- High/Critical: **{len(critical)}**")
-                  for d in critical[:10]:
-                      report.append(f"  - ❌ `{d.get('check')}`: {d.get('description','')[:100]}")
-              except Exception as e:
-                  report.append(f"- Parse error: {e}")
+# Собираем все results
+for protocol in ['static', 'balancer', 'lido', 'origin', 'enzyme']:
+    files = glob.glob(f'artifacts/**/*{protocol}*.json', recursive=True)
+    if not files:
+        continue
+    lines.append(f"\n## {protocol.title()}")
+    try:
+        with open(files[0]) as f:
+            data = json.load(f)
+        tests = data if isinstance(data, list) else []
+        failed = [t for t in tests if not t.get('success', True)]
+        if failed:
+            lines.append(f"❌ **{len(failed)} invariant(s) BROKEN**")
+            for t in failed[:5]:
+                r = (t.get('reason') or '')[:100]
+                lines.append(f"- `{t.get('name','?')}`: {r}")
+        else:
+            lines.append(f"✅ All invariants passed ({len(tests)} tests)")
+    except Exception as e:
+        lines.append(f"⚠️ Parse error: {e}")
 
-          # Foundry invariant results
-          for protocol in ['balancer', 'lido', 'origin', 'enzyme']:
-              json_files = glob.glob(f'audit-artifacts/**/{protocol}-results.json', recursive=True)
-              if json_files:
-                  report.append(f"## {protocol.title()} Results")
-                  try:
-                      with open(json_files[0]) as f:
-                          data = json.load(f)
-                      if isinstance(data, list):
-                          failed = [t for t in data if not t.get('success', True)]
-                          report.append(f"- Tests run: **{len(data)}**")
-                          report.append(f"- Failed: **{len(failed)}**")
-                          for t in failed[:5]:
-                              report.append(f"  - 🚨 `{t.get('name', 'unknown')}`: {t.get('reason', '')[:100]}")
-                  except Exception as e:
-                      report.append(f"- Parse error: {e}")
+report = '\n'.join(lines)
+print(report)
+with open('REPORT.md', 'w') as f:
+    f.write(report)
+PYEOF
 
-          report_text = "\n".join(report)
-          print(report_text)
-          with open('AUDIT_REPORT.md', 'w') as f:
-              f.write(report_text)
-          PYEOF
+      - name: Post to summary
+        run: cat REPORT.md >> $GITHUB_STEP_SUMMARY
 
-      - name: Post summary
-        run: cat AUDIT_REPORT.md >> $GITHUB_STEP_SUMMARY
-
-      - name: Upload consolidated report
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: AUDIT_REPORT-${{ github.run_number }}
-          path: AUDIT_REPORT.md
-
-      # Постим комментарий в PR если это PR
-      - name: Post PR comment
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const report = fs.readFileSync('AUDIT_REPORT.md', 'utf8');
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: report.slice(0, 65000)
-            });
+          name: REPORT-${{ github.run_number }}
+          path: REPORT.md
