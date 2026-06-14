@@ -1,213 +1,134 @@
-# .github/workflows/audit-campaign.yml
-# Путь: ~/audit-scratch/.github/workflows/audit-campaign.yml
-
 name: Audit Campaign
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   schedule:
-    # Каждую ночь в 23:00 UTC
-    - cron: '0 23 * * *'
-  # Ручной запуск: Actions → Run workflow
+    - cron: '0 22 * * *'
   workflow_dispatch:
     inputs:
-      protocol:
-        description: 'Протокол для тестирования'
+      invariant_runs:
+        description: 'Invariant runs (fork tests — keep LOW, RPC-bound)'
         required: false
-        default: 'all'
-        type: choice
-        options: [ all, balancer, lido, origin, enzyme ]
-      runs:
-        description: 'Кол-во invariant runs'
+        default: '500'
+      invariant_depth:
+        description: 'Invariant depth (calls per sequence)'
         required: false
-        default: '500000'
+        default: '20'
 
-# ── Переменные для всех jobs ─────────────────────────────────────
 env:
-  FOUNDRY_PROFILE: ci
-  ETH_RPC_URL:        ${{ secrets.ETH_RPC_URL }}
-  ETHERSCAN_API_KEY:  ${{ secrets.ETHERSCAN_API_KEY }}
+  ETH_RPC_URL:       ${{ secrets.ETH_RPC_URL }}
+  ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
 
 jobs:
 
-  # ================================================================
-  # JOB 1 — Статический анализ (5-10 минут)
-  # Запускается всегда, быстро, находит очевидное
-  # ================================================================
+  # ── Slither (статический анализ) ─────────────────────────────────────────
   static:
-    name: "🔍 Slither + Aderyn"
+    name: Slither Static Analysis
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # Slither — самый популярный статический анализатор
       - name: Run Slither
         uses: crytic/slither-action@v0.4.0
-        id: slither
         with:
           node-version: '20'
-          slither-args: >-
-            --json slither.json
-            --checklist
-            --filter-paths "test|lib|mock"
+          slither-args: '--json slither.json --filter-paths "test|lib"'
         continue-on-error: true
 
-      # Aderyn — Rust-based, очень быстрый
-      - name: Install & Run Aderyn
-        run: |
-          curl -L https://raw.githubusercontent.com/Cyfrin/aderyn/dev/aderynup/install \
-            | bash -s -- -b ~/.local/bin
-          export PATH="$HOME/.local/bin:$PATH"
-          aderyn src/ --output aderyn.md || true
-
-      # Сохраняем результаты
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: static-${{ github.run_number }}
-          path: |
-            slither.json
-            aderyn.md
+          name: slither-${{ github.run_number }}
+          path: slither.json
 
-      # Краткая сводка в интерфейсе Actions
-      - name: Summary
-        if: always()
-        run: |
-          echo "## 🔍 Static Analysis" >> $GITHUB_STEP_SUMMARY
-          python3 - << 'PYEOF'
-import json, os
-try:
-    with open('slither.json') as f:
-        data = json.load(f)
-    detectors = data.get('results', {}).get('detectors', [])
-    high = [d for d in detectors if d.get('impact','').lower() in ['high','critical']]
-    print(f"| Category | Count |")
-    print(f"|----------|-------|")
-    print(f"| Total findings | {len(detectors)} |")
-    print(f"| High/Critical  | **{len(high)}** |")
-    for d in high[:5]:
-        desc = d.get('description','')[:80]
-        print(f"\n❌ **{d.get('check')}**: {desc}")
-except Exception as e:
-    print(f"⚠️ Could not parse: {e}")
-PYEOF
-          >> $GITHUB_STEP_SUMMARY
-
-  # ================================================================
-  # JOB 2 — Balancer v2 Precision Hunt (6 часов)
-  # Ищет двухэтапные precision-loss атаки
-  # ================================================================
-  balancer:
-    name: "⚖️ Balancer v2 Precision"
+  # ── Build и базовые тесты ────────────────────────────────────────────────
+  build:
+    name: Build
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    if: |
-      github.event.inputs.protocol == 'all' ||
-      github.event.inputs.protocol == 'balancer' ||
-      github.event.inputs.protocol == ''
-
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-        with: { submodules: recursive }
+        with:
+          submodules: recursive
 
       - uses: foundry-rs/foundry-toolchain@v1
-        with: { version: stable }
 
-      # Кэш между запусками — ускоряет сборку
       - name: Cache build
         uses: actions/cache@v4
         with:
           path: |
             cache/
             out/
-          key: build-${{ hashFiles('src/**/*.sol', 'foundry.toml') }}
+          key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
           restore-keys: build-
 
-      # Восстановить corpus из предыдущих запусков
-      - name: Restore corpus
+      - name: Forge build
+        run: forge build
+
+      - name: Quick tests (no fork)
+        run: forge test --no-match-test "Fork|fork|Invariant|invariant" -v
+        continue-on-error: true
+
+  # ── Balancer v2 Precision Hunt ────────────────────────────────────────────
+  balancer:
+    name: Balancer Invariant
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Cache build
         uses: actions/cache@v4
         with:
-          path: .foundry/fuzzing/
-          key: corpus-balancer-${{ github.repository }}-${{ hashFiles('src/**') }}
-          restore-keys: corpus-balancer-${{ github.repository }}-
+          path: |
+            cache/
+            out/
+          key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
 
       - name: Build
         run: forge build
 
-      - name: Balancer Invariant Campaign
+      # ИСПРАВЛЕНО: пиннинг блока внутри теста (vm.createSelectFork с числом)
+      # FOUNDRY_INVARIANT_RUNS снижен — на fork каждый run = RPC вызовы
+      - name: Balancer Precision Invariant
         env:
-          INVARIANT_RUNS: ${{ github.event.inputs.runs || '500000' }}
+          FOUNDRY_INVARIANT_RUNS:           ${{ github.event.inputs.invariant_runs || '500' }}
+          FOUNDRY_INVARIANT_DEPTH:          ${{ github.event.inputs.invariant_depth || '20' }}
+          FOUNDRY_INVARIANT_FAIL_ON_REVERT: "false"
+          FOUNDRY_FUZZ_RUNS:                "1000"
         run: |
           forge test \
-            --match-contract "BalancerPrecision|BalancerRateProvider|BalancerTwoStage" \
-            --fork-url "$ETH_RPC_URL" \
-            --invariant-runs "$INVARIANT_RUNS" \
-            --invariant-depth 500 \
-            --fuzz-runs 1000000 \
-            --json 2>&1 | tee balancer-results.json
+            --match-contract BalancerPrecisionInvariant \
+            -vv 2>&1 | tee balancer.log
         continue-on-error: true
-
-      # Сохранить обогащённый corpus
-      - name: Save corpus
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: .foundry/fuzzing/
-          key: corpus-balancer-${{ github.repository }}-${{ github.sha }}
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: balancer-${{ github.run_number }}
-          path: balancer-results.json
+          path: balancer.log
 
-      - name: Balancer Summary
-        if: always()
-        run: |
-          echo "## ⚖️ Balancer v2 Results" >> $GITHUB_STEP_SUMMARY
-          python3 - << 'PYEOF'
-import json
-try:
-    with open('balancer-results.json') as f:
-        data = json.load(f)
-    tests = data if isinstance(data, list) else []
-    failed = [t for t in tests if not t.get('success', True)]
-    print(f"| Tests | Count |")
-    print(f"|-------|-------|")
-    print(f"| Run   | {len(tests)} |")
-    print(f"| Passed | {len(tests) - len(failed)} |")
-    print(f"| **Failed** | **{len(failed)}** |")
-    for t in failed[:10]:
-        name   = t.get('name', 'unknown')
-        reason = (t.get('reason') or t.get('counterexample', {}).get('error', ''))[:120]
-        print(f"\n🚨 **{name}**\n```\n{reason}\n```")
-except Exception as e:
-    print(f"⚠️ Parse error: {e}")
-PYEOF
-          >> $GITHUB_STEP_SUMMARY
-
-  # ================================================================
-  # JOB 3 — Lido Oracle Boundary (4 часа)
-  # ================================================================
+  # ── Lido Oracle Boundary ──────────────────────────────────────────────────
   lido:
-    name: "🔷 Lido Oracle"
+    name: Lido Invariant
     runs-on: ubuntu-latest
-    timeout-minutes: 240
-    if: |
-      github.event.inputs.protocol == 'all' ||
-      github.event.inputs.protocol == 'lido' ||
-      github.event.inputs.protocol == ''
-
+    timeout-minutes: 60
+    needs: build
     steps:
       - uses: actions/checkout@v4
-        with: { submodules: recursive }
+        with:
+          submodules: recursive
+
       - uses: foundry-rs/foundry-toolchain@v1
-        with: { version: stable }
 
       - name: Cache build
         uses: actions/cache@v4
@@ -215,59 +136,43 @@ PYEOF
           path: |
             cache/
             out/
-          key: build-${{ hashFiles('src/**/*.sol', 'foundry.toml') }}
-
-      - name: Restore corpus
-        uses: actions/cache@v4
-        with:
-          path: .foundry/fuzzing/
-          key: corpus-lido-${{ github.repository }}-${{ hashFiles('src/**') }}
-          restore-keys: corpus-lido-${{ github.repository }}-
+          key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
 
       - name: Build
         run: forge build
 
-      - name: Lido Invariant Campaign
+      # ИСПРАВЛЕНО: блок запинен в setUp() (22_000_000)
+      # runs снижен с 100000 до 500 — fork RPC bound, не CPU bound
+      - name: Lido Oracle Invariant
+        env:
+          FOUNDRY_INVARIANT_RUNS:           ${{ github.event.inputs.invariant_runs || '500' }}
+          FOUNDRY_INVARIANT_DEPTH:          ${{ github.event.inputs.invariant_depth || '20' }}
+          FOUNDRY_INVARIANT_FAIL_ON_REVERT: "false"
+          FOUNDRY_FUZZ_RUNS:                "1000"
         run: |
           forge test \
-            --match-contract "LidoOracle|LidoShare|LidoBunker" \
-            --fork-url "$ETH_RPC_URL" \
-            --invariant-runs 300000 \
-            --invariant-depth 300 \
-            --fuzz-runs 1000000 \
-            --json 2>&1 | tee lido-results.json
+            --match-contract LidoOracleInvariant \
+            -vv 2>&1 | tee lido.log
         continue-on-error: true
-
-      - name: Save corpus
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: .foundry/fuzzing/
-          key: corpus-lido-${{ github.repository }}-${{ github.sha }}
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: lido-${{ github.run_number }}
-          path: lido-results.json
+          path: lido.log
 
-  # ================================================================
-  # JOB 4 — Origin Protocol (4 часа)
-  # ================================================================
+  # ── Origin Protocol ───────────────────────────────────────────────────────
   origin:
-    name: "🟠 Origin Protocol"
+    name: Origin Protocol Invariant
     runs-on: ubuntu-latest
-    timeout-minutes: 240
-    if: |
-      github.event.inputs.protocol == 'all' ||
-      github.event.inputs.protocol == 'origin' ||
-      github.event.inputs.protocol == ''
-
+    timeout-minutes: 60
+    needs: build
     steps:
       - uses: actions/checkout@v4
-        with: { submodules: recursive }
+        with:
+          submodules: recursive
+
       - uses: foundry-rs/foundry-toolchain@v1
-        with: { version: stable }
 
       - name: Cache build
         uses: actions/cache@v4
@@ -275,104 +180,26 @@ PYEOF
           path: |
             cache/
             out/
-          key: build-${{ hashFiles('src/**/*.sol', 'foundry.toml') }}
-
-      - name: Restore corpus
-        uses: actions/cache@v4
-        with:
-          path: .foundry/fuzzing/
-          key: corpus-origin-${{ github.repository }}-${{ hashFiles('src/**') }}
-          restore-keys: corpus-origin-${{ github.repository }}-
+          key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
 
       - name: Build
         run: forge build
 
-      - name: Origin Invariant Campaign
+      - name: Origin Protocol Invariant
+        env:
+          FOUNDRY_INVARIANT_RUNS:           ${{ github.event.inputs.invariant_runs || '500' }}
+          FOUNDRY_INVARIANT_DEPTH:          ${{ github.event.inputs.invariant_depth || '20' }}
+          FOUNDRY_INVARIANT_FAIL_ON_REVERT: "false"
+          FOUNDRY_FUZZ_RUNS:                "1000"
         run: |
           forge test \
-            --match-contract "OriginProtocol|OriginARM|OriginYield|OriginRebase" \
-            --fork-url "$ETH_RPC_URL" \
-            --invariant-runs 300000 \
-            --fuzz-runs 1000000 \
-            --json 2>&1 | tee origin-results.json
+            --match-contract OriginProtocolInvariant \
+            -vv 2>&1 | tee origin.log
         continue-on-error: true
-
-      - name: Save corpus
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: .foundry/fuzzing/
-          key: corpus-origin-${{ github.repository }}-${{ github.sha }}
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: origin-${{ github.run_number }}
-          path: origin-results.json
+          path: origin.log
 
-  # ================================================================
-  # JOB 5 — Финальный отчёт
-  # Запускается после всех jobs, всегда
-  # ================================================================
-  report:
-    name: "📋 Audit Report"
-    runs-on: ubuntu-latest
-    needs: [ static, balancer, lido, origin ]
-    if: always()
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts/
-
-      - name: Generate report
-        run: |
-          python3 - << 'PYEOF'
-import json, glob, os
-from datetime import datetime
-
-lines = [
-    "# 🔒 Audit Campaign Report",
-    f"**Run**: #{os.environ.get('GITHUB_RUN_NUMBER','?')}",
-    f"**Date**: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-    f"**Commit**: `{os.environ.get('GITHUB_SHA','?')[:8]}`",
-    "",
-    "---",
-]
-
-# Собираем все results
-for protocol in ['static', 'balancer', 'lido', 'origin', 'enzyme']:
-    files = glob.glob(f'artifacts/**/*{protocol}*.json', recursive=True)
-    if not files:
-        continue
-    lines.append(f"\n## {protocol.title()}")
-    try:
-        with open(files[0]) as f:
-            data = json.load(f)
-        tests = data if isinstance(data, list) else []
-        failed = [t for t in tests if not t.get('success', True)]
-        if failed:
-            lines.append(f"❌ **{len(failed)} invariant(s) BROKEN**")
-            for t in failed[:5]:
-                r = (t.get('reason') or '')[:100]
-                lines.append(f"- `{t.get('name','?')}`: {r}")
-        else:
-            lines.append(f"✅ All invariants passed ({len(tests)} tests)")
-    except Exception as e:
-        lines.append(f"⚠️ Parse error: {e}")
-
-report = '\n'.join(lines)
-print(report)
-with open('REPORT.md', 'w') as f:
-    f.write(report)
-PYEOF
-
-      - name: Post to summary
-        run: cat REPORT.md >> $GITHUB_STEP_SUMMARY
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: REPORT-${{ github.run_number }}
-          path: REPORT.md
