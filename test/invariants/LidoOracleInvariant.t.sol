@@ -18,7 +18,7 @@ contract LidoOracleInvariant is Test {
 
     function setUp() public {
         // КРИТИЧНО: пиннинг блока = кэш = без 429 и без 4-часового timeout
-        vm.createSelectFork(vm.envString("ETH_RPC_URL"), 22_000_000);
+        vm.createSelectFork("mainnet", 22_000_000);
         lido = ILido(LIDO);
         sharePriceBefore = lido.getPooledEthByShares(1e27);
         targetContract(address(this));
