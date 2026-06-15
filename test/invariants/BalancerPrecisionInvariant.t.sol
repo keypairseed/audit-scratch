@@ -30,7 +30,7 @@ contract BalancerPrecisionInvariant is Test {
 
     function setUp() public {
         // КРИТИЧНО: пиннинг блока = кэш стейта = без rate limiting
-        vm.createSelectFork(vm.envString("ETH_RPC_URL"), 22_000_000);
+        vm.createSelectFork("mainnet", 22_000_000);
 
         vault = IVault(0xBA12222222228d8Ba445958a75a0704d566BF2C8); // Balancer Vault
 
