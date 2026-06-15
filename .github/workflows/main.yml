@@ -15,6 +15,10 @@ on:
         description: 'Invariant depth (calls per sequence)'
         required: false
         default: '20'
+      local_runs:
+        description: 'Invariant runs for NO-RPC local tests (can be large)'
+        required: false
+        default: '50000'
 
 env:
   ETH_RPC_URL:       ${{ secrets.ETH_RPC_URL }}
@@ -22,9 +26,11 @@ env:
 
 jobs:
 
-  # ── Slither (статический анализ) ─────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════
+  # STATIC ANALYSIS — Slither + Aderyn (no RPC, ~2 min)
+  # ════════════════════════════════════════════════════════════════════════
   static:
-    name: Slither Static Analysis
+    name: Static Analysis (Slither + Aderyn)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -39,13 +45,28 @@ jobs:
           slither-args: '--json slither.json --filter-paths "test|lib"'
         continue-on-error: true
 
+      - name: Install Aderyn
+        run: |
+          curl -L https://raw.githubusercontent.com/Cyfrin/aderyn/dev/aderynup/install \
+            | bash -s -- -b ~/.local/bin
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+        continue-on-error: true
+
+      - name: Run Aderyn
+        run: aderyn src/ --output aderyn.md || true
+        continue-on-error: true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: slither-${{ github.run_number }}
-          path: slither.json
+          name: static-${{ github.run_number }}
+          path: |
+            slither.json
+            aderyn.md
 
-  # ── Build и базовые тесты ────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════
+  # BUILD — compile once, cache for everything else
+  # ════════════════════════════════════════════════════════════════════════
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -69,13 +90,15 @@ jobs:
       - name: Forge build
         run: forge build
 
-      - name: Quick tests (no fork)
-        run: forge test --no-match-test "Fork|fork|Invariant|invariant" -v
+      - name: Quick tests (no fork, no invariant)
+        run: forge test --no-match-test "Fork|fork|Invariant|invariant|check_|Symbolic" -v
         continue-on-error: true
 
-  # ── Balancer v2 Precision Hunt ────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════
+  # T6 — Balancer v2 Precision Hunt (FORK, block-pinned, RPC-bound)
+  # ════════════════════════════════════════════════════════════════════════
   balancer:
-    name: Balancer Invariant
+    name: "[T6] Balancer Invariant (fork)"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: build
@@ -94,11 +117,17 @@ jobs:
             out/
           key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
 
+      # RPC cache — block 22M state persists across nightly runs
+      - name: Restore RPC cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.foundry/cache/rpc/
+          key: rpc-cache-balancer-block22M
+          restore-keys: rpc-cache-balancer-
+
       - name: Build
         run: forge build
 
-      # ИСПРАВЛЕНО: пиннинг блока внутри теста (vm.createSelectFork с числом)
-      # FOUNDRY_INVARIANT_RUNS снижен — на fork каждый run = RPC вызовы
       - name: Balancer Precision Invariant
         env:
           FOUNDRY_INVARIANT_RUNS:           ${{ github.event.inputs.invariant_runs || '500' }}
@@ -111,15 +140,24 @@ jobs:
             -vv 2>&1 | tee balancer.log
         continue-on-error: true
 
+      - name: Save RPC cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.foundry/cache/rpc/
+          key: rpc-cache-balancer-block22M-${{ github.run_id }}
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: balancer-${{ github.run_number }}
           path: balancer.log
 
-  # ── Lido Oracle Boundary ──────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════
+  # T6 — Lido Oracle Boundary (FORK, block-pinned, RPC-bound)
+  # ════════════════════════════════════════════════════════════════════════
   lido:
-    name: Lido Invariant
+    name: "[T6] Lido Invariant (fork)"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: build
@@ -138,11 +176,16 @@ jobs:
             out/
           key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
 
+      - name: Restore RPC cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.foundry/cache/rpc/
+          key: rpc-cache-lido-block22M
+          restore-keys: rpc-cache-lido-
+
       - name: Build
         run: forge build
 
-      # ИСПРАВЛЕНО: блок запинен в setUp() (22_000_000)
-      # runs снижен с 100000 до 500 — fork RPC bound, не CPU bound
       - name: Lido Oracle Invariant
         env:
           FOUNDRY_INVARIANT_RUNS:           ${{ github.event.inputs.invariant_runs || '500' }}
@@ -155,15 +198,24 @@ jobs:
             -vv 2>&1 | tee lido.log
         continue-on-error: true
 
+      - name: Save RPC cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.foundry/cache/rpc/
+          key: rpc-cache-lido-block22M-${{ github.run_id }}
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: lido-${{ github.run_number }}
           path: lido.log
 
-  # ── Origin Protocol ───────────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════
+  # T6 — Origin Protocol (FORK, block-pinned, RPC-bound)
+  # ════════════════════════════════════════════════════════════════════════
   origin:
-    name: Origin Protocol Invariant
+    name: "[T6] Origin Protocol Invariant (fork)"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: build
@@ -181,6 +233,13 @@ jobs:
             cache/
             out/
           key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
+
+      - name: Restore RPC cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.foundry/cache/rpc/
+          key: rpc-cache-origin-block22M
+          restore-keys: rpc-cache-origin-
 
       - name: Build
         run: forge build
@@ -197,9 +256,263 @@ jobs:
             -vv 2>&1 | tee origin.log
         continue-on-error: true
 
+      - name: Save RPC cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.foundry/cache/rpc/
+          key: rpc-cache-origin-block22M-${{ github.run_id }}
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: origin-${{ github.run_number }}
           path: origin.log
 
+  # ════════════════════════════════════════════════════════════════════════
+  # T1/T2/T7 — Precision State-Space Invariant (NO RPC — run for HOURS)
+  # ════════════════════════════════════════════════════════════════════════
+  precision-invariant:
+    name: "[T1/T2/T44] Precision State-Space (no RPC)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Cache build
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache/
+            out/
+          key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
+
+      - name: Build
+        run: forge build
+
+      # NO --fork-url anywhere. Pure in-memory. Can push runs much higher.
+      - name: Precision State-Space Invariant
+        env:
+          FOUNDRY_INVARIANT_RUNS:           ${{ github.event.inputs.local_runs || '50000' }}
+          FOUNDRY_INVARIANT_DEPTH:          "100"
+          FOUNDRY_INVARIANT_FAIL_ON_REVERT: "false"
+          FOUNDRY_FUZZ_RUNS:                "100000"
+        run: |
+          forge test \
+            --match-contract PrecisionStateSpaceInvariant \
+            -vv 2>&1 | tee precision-invariant.log
+        continue-on-error: true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: precision-invariant-${{ github.run_number }}
+          path: precision-invariant.log
+
+  # ════════════════════════════════════════════════════════════════════════
+  # T3 — Differential Testing: rounding-order divergence (NO RPC)
+  # ════════════════════════════════════════════════════════════════════════
+  differential:
+    name: "[T3] Scaling Order Differential (no RPC)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Cache build
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache/
+            out/
+          key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
+
+      - name: Build
+        run: forge build
+
+      - name: Differential Fuzz
+        env:
+          FOUNDRY_FUZZ_RUNS: "200000"
+        run: |
+          forge test \
+            --match-contract ScalingOrderDifferential \
+            -vvv 2>&1 | tee differential.log
+        continue-on-error: true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: differential-${{ github.run_number }}
+          path: differential.log
+
+  # ════════════════════════════════════════════════════════════════════════
+  # T4 — Symbolic Execution via Halmos (NO RPC — proofs, not samples)
+  # ════════════════════════════════════════════════════════════════════════
+  halmos:
+    name: "[T4] Halmos Symbolic Proofs (no RPC)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Cache build
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache/
+            out/
+          key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
+
+      - name: Build
+        run: forge build
+
+      - name: Install Halmos
+        run: pip install halmos --break-system-packages
+
+      - name: Halmos Symbolic Proofs
+        run: |
+          halmos \
+            --contract PrecisionSymbolic \
+            --solver-timeout-assertion 60000 \
+            --loop 3 \
+            2>&1 | tee halmos.log
+        continue-on-error: true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: halmos-${{ github.run_number }}
+          path: halmos.log
+
+  # ════════════════════════════════════════════════════════════════════════
+  # T1/T5/T7 — Medusa Sequence Discovery (NO RPC, corpus persists overnight)
+  # ════════════════════════════════════════════════════════════════════════
+  medusa-precision:
+    name: "[T1/T5/T7] Medusa Sequence Discovery (no RPC)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install Medusa
+        run: |
+          go install github.com/crytic/medusa/cmd/medusa@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Build
+        run: forge build --build-info
+
+      # Corpus persists across nightly runs — Medusa resumes exploration
+      # from where it left off, never starting from zero.
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: corpus/precision/
+          key: medusa-corpus-precision-${{ hashFiles('src/lib/**', 'test/invariants/PrecisionStateSpaceInvariant.t.sol') }}
+          restore-keys: medusa-corpus-precision-
+
+      - name: Medusa Campaign
+        run: medusa fuzz --config medusa.json 2>&1 | tee medusa.log
+        continue-on-error: true
+
+      - name: Save corpus
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: corpus/precision/
+          key: medusa-corpus-precision-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: medusa-${{ github.run_number }}
+          path: |
+            medusa.log
+            corpus/precision/
+
+  # ════════════════════════════════════════════════════════════════════════
+  # REPORT — aggregate all results, classify infra-failure vs finding
+  # ════════════════════════════════════════════════════════════════════════
+  report:
+    name: Audit Report
+    runs-on: ubuntu-latest
+    needs: [static, balancer, lido, origin, precision-invariant, differential, halmos, medusa-precision]
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Classify and summarize
+        run: |
+          python3 - << 'PYEOF'
+          import glob, os
+
+          INFRA_PATTERNS = [
+              "could not instantiate forked environment",
+              "Max retries exceeded",
+              "HTTP error 429",
+              "Internal transport error",
+          ]
+
+          def classify(text):
+              for p in INFRA_PATTERNS:
+                  if p in text:
+                      return "INFRA"
+              if "FAIL:" in text or "CRITICAL" in text or "DIVERGENCE FOUND" in text:
+                  return "FINDING"
+              if "[PASS]" in text:
+                  return "OK"
+              return "UNKNOWN"
+
+          lines = ["# Audit Campaign Report", ""]
+          for log in sorted(glob.glob("artifacts/**/*.log", recursive=True)):
+              name = os.path.basename(log)
+              with open(log, errors="ignore") as f:
+                  text = f.read()
+              status = classify(text)
+              icon = {"OK": "✅", "FINDING": "🚨", "INFRA": "🔧", "UNKNOWN": "❓"}[status]
+              lines.append(f"## {icon} {name} — {status}")
+              if status == "FINDING":
+                  for line in text.splitlines():
+                      if "FAIL:" in line or "CRITICAL" in line or "DIVERGENCE" in line:
+                          lines.append(f"  - {line.strip()}")
+              lines.append("")
+
+          report = "\n".join(lines)
+          print(report)
+          with open("REPORT.md", "w") as f:
+              f.write(report)
+          PYEOF
+
+      - name: Post to summary
+        run: cat REPORT.md >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: REPORT-${{ github.run_number }}
+          path: REPORT.md

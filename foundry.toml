@@ -37,5 +37,3 @@ depth = 1000
 [rpc_endpoints]
 mainnet = "${ETH_RPC_URL}"
 
-[rpc_endpoints]
-mainnet = "${ETH_RPC_URL}"
