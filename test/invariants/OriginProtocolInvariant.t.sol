@@ -26,7 +26,7 @@ contract OriginProtocolInvariant is Test {
     uint256 totalValueSnapshot;
 
     function setUp() public {
-        vm.createSelectFork("mainnet", 22_000_000);
+        vm.createSelectFork(vm.envString("ETH_RPC_URL"), 22_000_000);
 
         vault   = IOriginVault(OETH_VAULT);
         oeth    = IOETH(OETH);
