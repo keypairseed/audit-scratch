@@ -420,7 +420,7 @@ jobs:
 
       - name: Install Medusa
         run: |
-          go install github.com/crytic/medusa/cmd/medusa@latest
+          go install github.com/crytic/medusa@latest
           echo "$HOME/go/bin" >> $GITHUB_PATH
 
       - name: Build
