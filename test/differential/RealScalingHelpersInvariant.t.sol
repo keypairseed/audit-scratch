@@ -27,7 +27,7 @@ contract RealScalingHelpersInvariant is Test {
         uint256 amount,
         uint8 decimalsIndex,
         uint256 tokenRate
-    ) external pure {
+    ) external view {
         uint256 scalingFactor = DECIMAL_SCALING_FACTORS[decimalsIndex % 19];
         tokenRate = bound(tokenRate, 5e17, 5e18); // щедрый диапазон LST/RWA rate
         amount    = bound(amount, 1, 1e24);
@@ -46,7 +46,7 @@ contract RealScalingHelpersInvariant is Test {
         uint256 amount,
         uint8 decimalsIndex,
         uint256 tinyRate
-    ) external pure {
+    ) external view {
         uint256 scalingFactor = DECIMAL_SCALING_FACTORS[decimalsIndex % 19];
         tinyRate = bound(tinyRate, 1, 1e15); // 0.000001x до 0.001x — broken provider
         amount   = bound(amount, 1, 1e24);
@@ -63,7 +63,7 @@ contract RealScalingHelpersInvariant is Test {
         uint256 amount,
         uint8 decimalsIndex,
         uint256 tokenRate
-    ) external pure {
+    ) external view {
         uint256 scalingFactor = DECIMAL_SCALING_FACTORS[decimalsIndex % 19];
         tokenRate = bound(tokenRate, 1e15, 1e19);
         amount    = bound(amount, 1, 1e24);
@@ -75,7 +75,7 @@ contract RealScalingHelpersInvariant is Test {
     }
 
     // ── ТЕСТ 4: computeRateRoundUp никогда не уменьшает rate ────────────────
-    function testFuzz_computeRateRoundUp_neverDecreases(uint256 rate) external pure {
+    function testFuzz_computeRateRoundUp_neverDecreases(uint256 rate) external view {
         rate = bound(rate, 1, 1e30);
         uint256 rounded = ScalingHelpers.computeRateRoundUp(rate);
 
@@ -86,7 +86,7 @@ contract RealScalingHelpersInvariant is Test {
     // ── ТЕСТ 5: known boundary — экстремальный decimals спред (0 vs 18) ────
     // USDC-подобный токен (6 decimals, sf=1e12) против чистого 18-decimal,
     // с rate на грани депега LST (0.9x), точка где Nov-2025-класс атак искал
-    function test_extremeDecimalsSpreadWithDepeg() external pure {
+    function test_extremeDecimalsSpreadWithDepeg() external view {
         uint256 sfUSDC = 1e12;  // 6 decimals
         uint256 sf18   = 1;     // 18 decimals
         uint256 depegRate = 9e17; // 0.9x — депег сценарий
