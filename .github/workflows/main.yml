@@ -153,11 +153,11 @@ jobs:
           name: balancer-${{ github.run_number }}
           path: balancer.log
 
-  # ════════════════════════════════════════════════════════════════════════
-  # T6 — Lido Oracle Boundary (FORK, block-pinned, RPC-bound)
-  # ════════════════════════════════════════════════════════════════════════
+# ================================================================
+  # Lido Oracle Boundary — через throttled anvil proxy
+  # ================================================================
   lido:
-    name: "[T6] Lido Invariant (fork)"
+    name: Lido Invariant
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: build
@@ -176,46 +176,58 @@ jobs:
             out/
           key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
 
-      - name: Restore RPC cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.foundry/cache/rpc/
-          key: rpc-cache-lido-block22M
-          restore-keys: rpc-cache-lido-
-
       - name: Build
         run: forge build
 
-      - name: Lido Oracle Invariant
+      # Throttled anvil — поглощает burst-запросы вместо прямой передачи в Alchemy.
+      # Решает 429 на этапе setUp() invariant fuzzer, который происходит ДО
+      # первого реального вызова (проверка default sender-адресов).
+      - name: Start throttled anvil proxy
+        run: |
+          nohup anvil \
+            --fork-url "${{ secrets.ETH_RPC_URL }}" \
+            --fork-block-number 22000000 \
+            --compute-units-per-second 300 \
+            --port 8545 > anvil.log 2>&1 &
+          echo "Waiting for anvil..."
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:8545 -X POST -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+              | grep -q result; then
+              echo "Anvil ready"
+              break
+            fi
+            sleep 1
+          done
+
+      # ETH_RPC_URL переопределён ТОЛЬКО для этого шага — foundry.toml's
+      # [rpc_endpoints] mainnet = "${ETH_RPC_URL}" подхватит localhost
+      - name: Lido Oracle Invariant (via throttled anvil)
         env:
-          FOUNDRY_INVARIANT_RUNS:           ${{ github.event.inputs.invariant_runs || '500' }}
-          FOUNDRY_INVARIANT_DEPTH:          ${{ github.event.inputs.invariant_depth || '20' }}
-          FOUNDRY_INVARIANT_FAIL_ON_REVERT: "false"
-          FOUNDRY_FUZZ_RUNS:                "1000"
+          ETH_RPC_URL: "http://127.0.0.1:8545"
         run: |
           forge test \
             --match-contract LidoOracleInvariant \
             -vv 2>&1 | tee lido.log
         continue-on-error: true
 
-      - name: Save RPC cache
-        uses: actions/cache/save@v4
+      - name: Stop anvil
         if: always()
-        with:
-          path: ~/.foundry/cache/rpc/
-          key: rpc-cache-lido-block22M-${{ github.run_id }}
+        run: pkill anvil || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: lido-${{ github.run_number }}
-          path: lido.log
+          path: |
+            lido.log
+            anvil.log
 
-  # ════════════════════════════════════════════════════════════════════════
-  # T6 — Origin Protocol (FORK, block-pinned, RPC-bound)
-  # ════════════════════════════════════════════════════════════════════════
+  # ================================================================
+  # Origin Protocol — через throttled anvil proxy
+  # ================================================================
   origin:
-    name: "[T6] Origin Protocol Invariant (fork)"
+    name: Origin Protocol Invariant
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: build
@@ -234,40 +246,47 @@ jobs:
             out/
           key: build-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'foundry.toml') }}
 
-      - name: Restore RPC cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.foundry/cache/rpc/
-          key: rpc-cache-origin-block22M
-          restore-keys: rpc-cache-origin-
-
       - name: Build
         run: forge build
 
-      - name: Origin Protocol Invariant
+      - name: Start throttled anvil proxy
+        run: |
+          nohup anvil \
+            --fork-url "${{ secrets.ETH_RPC_URL }}" \
+            --fork-block-number 22000000 \
+            --compute-units-per-second 300 \
+            --port 8545 > anvil.log 2>&1 &
+          echo "Waiting for anvil..."
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:8545 -X POST -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+              | grep -q result; then
+              echo "Anvil ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Origin Protocol Invariant (via throttled anvil)
         env:
-          FOUNDRY_INVARIANT_RUNS:           ${{ github.event.inputs.invariant_runs || '500' }}
-          FOUNDRY_INVARIANT_DEPTH:          ${{ github.event.inputs.invariant_depth || '20' }}
-          FOUNDRY_INVARIANT_FAIL_ON_REVERT: "false"
-          FOUNDRY_FUZZ_RUNS:                "1000"
+          ETH_RPC_URL: "http://127.0.0.1:8545"
         run: |
           forge test \
             --match-contract OriginProtocolInvariant \
             -vv 2>&1 | tee origin.log
         continue-on-error: true
 
-      - name: Save RPC cache
-        uses: actions/cache/save@v4
+      - name: Stop anvil
         if: always()
-        with:
-          path: ~/.foundry/cache/rpc/
-          key: rpc-cache-origin-block22M-${{ github.run_id }}
+        run: pkill anvil || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: origin-${{ github.run_number }}
-          path: origin.log
+          path: |
+            origin.log
+            anvil.log
 
   # ════════════════════════════════════════════════════════════════════════
   # T1/T2/T7 — Precision State-Space Invariant (NO RPC — run for HOURS)
@@ -422,6 +441,7 @@ jobs:
         run: |
           go install github.com/crytic/medusa@latest
           echo "$HOME/go/bin" >> $GITHUB_PATH
+    pip install crytic-compile --break-system-packages
 
       - name: Build
         run: forge build --build-info
